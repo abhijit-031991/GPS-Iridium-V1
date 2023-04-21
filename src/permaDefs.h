@@ -54,5 +54,3 @@ struct data{
     float hdop;
     bool act;
   };
-
-
