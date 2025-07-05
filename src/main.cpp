@@ -1,83 +1,65 @@
-#define TINY_GSM_MODEM_SIM800
-#define ARDUINOJSON_USE_LONG_LONG 1
-
 #include <Arduino.h>
 #include <permaDefs.h>
-#include <Wire.h>
 #include <SPI.h>
+#include <Wire.h>
+#include <time.h>
+#include <TimeLib.h>
+#include <LoRa.h>
+#include <EEPROM.h>
 #include <TinyGPS++.h>
 #include <SPIMemory.h>
 #include <elapsedMillis.h>
-#include <MCP79412RTC.h>
-#include <DFRobot_LIS2DW12.h>
 #include <avr/sleep.h>
-#include <TimeLib.h>
-#include <time.h>
-#include <IridiumSBD.h> // Click here to get the library: http://librarymanager/All#IridiumSBDI2C
+#include <DFRobot_LIS2DW12.h>
+#include <IridiumSBD.h>
 
-// Definittions //
-
-#define SerialMon Serial
 #define IridiumSerial Serial2
 #define DIAGNOSTICS true // Change this to see diagnostics
 
-
-// Library Definitions //
-
-elapsedMillis mTime;
+//*** Library Declarations ***//
 elapsedMillis Btime;
+elapsedMillis mTime;
 TinyGPSPlus gps;
 SPIFlash flash(FCS);
-MCP79412RTC rtc(false);
 DFRobot_LIS2DW12_I2C acce;
 IridiumSBD modem(IridiumSerial);
 
 
-//*********** Setting Variables ***********//
 
-// Mode Control variable //
-int mainMode = 0;                   // switch Mode variable(0 = main, 1 = live tracking)
+//#####################################################################################################//
+
+//*** Variables ***//
+
+// General Variables //
+uint16_t cnt;                     //** Total data points collected
+
+// Flash Addresses // 
+uint32_t wAdd = 0;                //** Last written to flash address
+uint32_t rAdd = 0;                //** Last read from flash address
 
 // GPS Control Variables //
-unsigned int gpsTimeout = 120;      // GPS Timeout in seconds  *** USER CONFIG ***
-int gpsFrequency = 15;              // GPS Frequency in Minutes *** USER CONFIG ***
-int gpsHdop = 5;                    // GPS HDOP *** USER CONFIG ***
-int sleepCounter = 0;               // Sleep Counter for live traccking mode
+int gpsFrequency = 2;            //(Minutes)>>> GPS Frequency in minutes *** USER CONFIG ***
+int gpsTimeout = 50;              //(Seconds)>>> GPS Timesout after 'x' seconds *** USER CONFIG ***
+int gpsHdop = 5;                  //(N/A)>>> GPS HODP Parameter *** USER CONFIG ***
 
-// GSM Control Variables //
-int transmissionFrequency = 360;     // Transmission Frequency in MINS
+// GPS Storage Variables //
+float lat;                        //** Storing last known Latitude
+float lng;                        //** Storing last known Longitude
 
-// GPS Storage Variables // 
-double lat;
-double lng;
-unsigned int count; 
+// Time Variables // 
+time_t strtTime = 1667704472;     //** Start Time Acquired by GPS on Start Up
 
-// Memory Variables //
-unsigned long wAdd = 1;
-unsigned long rAdd = 0;
-unsigned int cnt = 0;
+// Booleans and Flags //
+bool wipe_memory = true;         //>>> Wipe memory during reset/Activation
+bool activation_resp_rcvd = false;//** Flag to mark if activation commnd was rcvd
+bool gps_wait_time = false;
 
-// Time Variables //
-time_t last_act_trigger;
-time_t mortality_trigger_time;       // Mortality mode is triggered after this time
-time_t strtTime;
-time_t next_gps_wakeup;
-time_t next_gsm_wakeup;
-time_t currentTime;
-time_t live_tracking_start;
-time_t live_tracking_end;
+// Radio Variables //
+int radioFrequency = 1;           //Frequency of Pings in minutes *** USER CONFIG ***
+int rcv_duration = 3;             // Receive Window Duration in seconds *** USER CONFIG ***
 
-
-// Boolean Variables //
-bool activate = true;
-bool ret;
-bool act_mode = false;              // Activity Mode flag - shows if device is in activity mode
-bool mortality = false;             // Mortality Flag - show inactivity
-bool activity_enabled = false;      //** Activity Enabled Flag - 
-bool rtc_int_triggered = false;
-bool act_int_triggered = false;
-bool wipe_memory = true;           //** Memory Wipe flag -
-bool noSleepLt = false;
+// Iridium Variables //
+int transmissionFrequency = 6;
 
 // Control Variables //
 uint16_t pingSecondCounter;
@@ -85,9 +67,9 @@ uint16_t gpsSecondCounter;
 uint16_t pingCounterTarget;
 uint16_t gpsCounterTarget;
 
-//************************************************//
-//***************    FUNCTIONS    ****************//
-//************************************************//
+//#####################################################################################################//
+
+//*** Functions ***//
 void RTC_init(void)
 {
   /* Initialize RTC: */
@@ -110,6 +92,105 @@ ISR(RTC_PIT_vect)
   gpsSecondCounter = gpsSecondCounter + 1;
 }
 
+// Function 1 : Record and Store GPS data
+void recGPS(){
+  double hdopstrt = 10.00;
+  Btime = 0;
+  digitalWrite(GPS_PIN, HIGH);
+  while ((Btime/1000) <= gpsTimeout)
+  {
+    // Serial.println(currentTime-xa);
+    while (Serial1.available() > 0)
+    {
+      if (!gps.encode(Serial1.read()))
+      {
+        if (!gps.location.isValid())
+        {
+          Serial.println(F("Acquiring"));
+        }      
+      }else{
+        // Serial.println(gps.location.isUpdated());
+        // Serial.print(F("Location Age:"));
+        // Serial.println(gps.location.age());
+        // Serial.print(F("Time Age:"));
+        // Serial.println(gps.time.age());
+        Serial.print(F("HDOP Age:"));
+        Serial.println(gps.hdop.age());
+        // Serial.print(F("Satellites:"));
+        // Serial.println(gps.satellites.value());
+        Serial.print(F("HDOP:"));
+        Serial.println(gps.hdop.value());
+        if (gps.hdop.hdop() != 0.00)
+        {
+          hdopstrt = gps.hdop.hdop();
+          Serial.println(hdopstrt);
+        }
+      }    
+    }
+    if (hdopstrt < (double)gpsHdop && gps.location.age() < 1000 && gps.time.age() < 1000 && mTime > 3000 && gps.hdop.age() < 50)
+    {
+      break;
+    }  
+  }   
+
+  digitalWrite(GPS_PIN, LOW);
+  
+  data dat;
+
+  if (gps.location.age() < 60000)
+  {
+    //pack data into struct
+    lat = gps.location.lat();
+    lng = gps.location.lng();
+    dat.lat = gps.location.lat();
+    dat.lng = gps.location.lng();
+  }else{
+    // pack data into struct with lat long = 0
+    dat.lat = 0;
+    dat.lng = 0;
+  }
+    Serial.print(gps.date.day());Serial.print(gps.date.month());Serial.println(gps.date.year());
+    // digitalWrite(RTC_PIN, HIGH);
+    setTime(gps.time.hour(),gps.time.minute(),gps.time.second(),gps.date.day (), gps.date.month (),gps.date.year());
+    time_t x = now();
+    dat.datetime = x;
+    // digitalWrite(RTC_PIN, LOW);
+    dat.locktime = (Btime/1000);
+    dat.hdop = gps.hdop.hdop();
+    
+    
+    Serial.println(dat.datetime);
+    Serial.println(dat.lat);
+    Serial.println(dat.lng);
+    Serial.println(dat.locktime);
+    Serial.println(dat.hdop);
+
+
+  if (flash.powerUp())
+  {
+    Serial.println(F("Powered Up"));
+    delay(500);
+    Serial.println((int)sizeof(dat));
+    wAdd = flash.getAddress(sizeof(dat));
+    Serial.println(wAdd);
+    if (flash.writeAnything(wAdd, dat))
+    {
+      Serial.println(F("Write Successful"));
+      cnt = cnt + 1;
+    }else
+    {
+      Serial.println(F("Write Failed"));
+      Serial.println(flash.error(VERBOSE));
+    }     
+  }else
+  {
+    Serial.println(F("Power Up Failed"));
+  }   
+  flash.powerDown();
+
+}
+
+// Function 1-a : Secondary GPS Function used only in activation sequence
 void acqGPS(){
   digitalWrite(GPS_PIN, HIGH);
       do{ 
@@ -152,96 +233,36 @@ void acqGPS(){
     digitalWrite(GPS_PIN, LOW);
 }
 
-void recGPS(){
-  Btime = 0;
-  digitalWrite(GPS_PIN, HIGH);
-  Serial.println(gpsTimeout*1000);
-  while (Btime <= (gpsTimeout*1000))
-  {
-    while (Serial1.available())
-    {
-      if (!gps.encode(Serial1.read()))
-      {
-        if (!gps.location.isValid())
-        {
-          Serial.println(F("Acquiring"));
-        }else{
-          Serial.println(gps.location.isUpdated());
-          Serial.print(F("Location Age:"));
-          Serial.println(gps.location.age());
-          Serial.print(F("Time Age:"));
-          Serial.println(gps.time.age());
-          Serial.print(F("Date Age:"));
-          Serial.println(gps.date.age());
-          Serial.print(F("Satellites:"));
-          Serial.println(gps.satellites.value());
-          Serial.print(F("HDOP:"));
-          Serial.println(gps.hdop.hdop());
-        }       
-      }      
-    }
-    if (gps.hdop.hdop() < (double)gpsHdop && gps.location.age() < 1000 && gps.time.age() < 1000 && mTime > 3000)
-    {
-      break;
-    }  
-  }   
-  
-  digitalWrite(GPS_PIN, LOW);
-  
+// Function 2 : Read data from flash and send it through radio
+void read_send(){ 
   data dat;
-
-  if (gps.location.age() < 60000)
-  {
-    //pack data into struct
-    lat = gps.location.lat();
-    lng = gps.location.lng();
-    dat.lat = gps.location.lat();
-    dat.lng = gps.location.lng();
-  }else{
-    // pack data into struct with lat long = 0
-    dat.lat = 0;
-    dat.lng = 0;
-  }
-    Serial.print(gps.date.day());Serial.print(gps.date.month());Serial.println(gps.date.year());
-    setTime(gps.time.hour(), gps.time.minute(), gps.time.second(), gps.date.day(), gps.date.month(), gps.date.year());
-    dat.datetime = (uint32_t)now();
-    dat.locktime = mTime/1000;
-    dat.hdop = gps.hdop.hdop();
-    dat.act = act_mode;
-    
-    
-    Serial.println(dat.datetime);
-    Serial.println(dat.lat);
-    Serial.println(dat.lng);
-    Serial.println(dat.locktime);
-    Serial.println(dat.hdop);
-
 
   if (flash.powerUp())
   {
-    Serial.println(F("Powered Up"));
-    delay(500);
-    Serial.println((int)sizeof(dat));
-    wAdd = flash.getAddress(sizeof(dat));
-    Serial.println(wAdd);
-    if (flash.writeAnything(wAdd, dat))
+    if (flash.readAnything(rAdd, dat))
     {
-      Serial.println(F("Write Successful"));
-      cnt = cnt + 1;
+      // dat.id = tag;
+      Serial.println(F("Read Successful"));
+      Serial.println(dat.datetime);
+      Serial.println(dat.hdop);
+      Serial.println(dat.lat);
+      Serial.println(dat.lng);
+      Serial.println(dat.locktime);
     }else
     {
-      Serial.println(F("Write Failed"));
-      Serial.println(flash.error(VERBOSE));
-    }     
-  }else
-  {
-    Serial.println(F("Power Up Failed"));
-  }   
-  flash.powerDown();
-
+      Serial.println(F("Read Failed"));
+    }    
+  }
+      LoRa.idle();
+      LoRa.beginPacket();
+      LoRa.write((uint8_t*)&dat, sizeof(dat));
+      LoRa.endPacket();
+      LoRa.sleep();
 }
 
-void read_send(){ 
+// Function 3 : RTC Timer Interrupt Service Routine
+// Function 4 : Check the elctrodes for sumbersion/surfacing events
+void irdSend(){
   data dat;
   int err;
   if (flash.powerUp())
@@ -254,6 +275,7 @@ void read_send(){
       Serial.println(F("Read Failed"));
     } 
   }
+  Serial.println(F("Sending Data"));
   err = modem.sendSBDBinary((uint8_t*)&dat,sizeof(dat));
   if (err != ISBD_SUCCESS)
   {
@@ -261,112 +283,296 @@ void read_send(){
     Serial.println(err);
     if (err == ISBD_SENDRECEIVE_TIMEOUT)
       Serial.println(F("Try again!!."));
+  }else{
+    Serial.println(F("Transmitted"));
+  } 
+}
+
+// Function 5 : Pinger - Takes several inputs and sends ping
+void Ping(float x, float y, uint16_t a, uint16_t c, byte d){
+
+  ping p;
+
+  p.devtyp = d;
+  p.ta = a;
+  p.la = x;
+  p.ln = y;
+  p.cnt = c;
+
+  Serial.print(F("Size")); Serial.println((int)sizeof(p));
+  LoRa.idle();
+  LoRa.beginPacket();
+  LoRa.write((uint8_t*)&p, sizeof(p));
+  LoRa.endPacket();
+  LoRa.sleep();
+  
+}
+
+// Function 6 : Look for and process inbound transmission right after ping.
+void receive(unsigned int rcv_time){
+  Serial.println(F("Receiving"));
+  LoRa.idle();
+  mTime = 0;
+  int x = 0;
+  do
+  {  
+    x = LoRa.parsePacket();
+    if (x)
+    {
+      Serial.println(x);
+    }
+    
+    
+    if (x == 3)
+    { 
+      Serial.print(F("int : ")); Serial.println(x);
+      struct request{
+      uint16_t tag;
+      byte request;
+      }r;
+      while (LoRa.available())
+      {
+        Serial.println(F("Reading in"));
+        LoRa.readBytes((uint8_t*)&r, sizeof(r));
+      }
+      Serial.println(r.tag);
+      Serial.println(r.request);
+      if (r.tag == tag && r.request == (byte)82)
+      {
+        
+        do
+        {
+          Serial.println("Init Stream");
+          read_send();
+          delay(50);
+          rAdd = rAdd + 15;
+          Serial.println(rAdd);
+        
+        } while (rAdd <= wAdd);
+
+        delay(1000);
+        struct resp{
+        uint16_t tag;
+        byte res;
+        }r;
+        r.res = (byte) 68;
+        r.tag = tag;
+
+        LoRa.idle();
+        LoRa.beginPacket();
+        LoRa.write((uint8_t*)&r, sizeof(r));
+        LoRa.endPacket();
+        LoRa.sleep();
+      }            
+    }
+
+    if (x == 21)
+    {
+      setttings set;
+
+      while (LoRa.available())
+      {
+        Serial.println(F("Incoming Settings"));
+        LoRa.readBytes((uint8_t*)&set, sizeof(set));
+      }
+
+      gpsFrequency = set.gpsFrq;
+      gpsTimeout = set.gpsTout;
+      gpsHdop = set.hdop;
+      radioFrequency = set.radioFrq;
+      rcv_duration = set.rcv_dur;
+      
+      Serial.println(set.gpsFrq);
+      Serial.println(set.gpsTout);
+      Serial.println(set.hdop);
+      Serial.println(set.radioFrq);
+      Serial.println(set.rcv_dur);
+      delay(100);
+
+      resPing r;
+        r.resp = (byte)83;
+        r.tag = tag;
+
+        LoRa.idle();
+        LoRa.beginPacket();
+        LoRa.write((uint8_t*)&r, sizeof(r));
+        LoRa.endPacket();
+        LoRa.sleep();
+    }
+  }while(mTime <= rcv_time);
+  LoRa.sleep();
+  delay(50);
+}
+
+// Function 7 : First activation ping - process active/sleep/wipe modes
+void activationPing(){
+
+  reqPing px1;
+  resPing rs1;
+
+  int x;
+
+  px1.tag = tag;
+  px1.request = (byte)73;
+
+
+  LoRa.idle();
+  LoRa.beginPacket();
+  LoRa.write((uint8_t*)&px1, sizeof(px1));
+  LoRa.endPacket();
+  
+  mTime = 0;
+  while (mTime < 30000)
+  {
+    x = LoRa.parsePacket();
+    if (x)
+    {
+      activation_resp_rcvd = true;
+      Serial.println(F("Incoming"));
+      Serial.println(x);
+    }else{
+      activation_resp_rcvd = false;
+    }
+    
+    if (x == 3)
+    {
+      while (LoRa.available())
+      {
+        Serial.println(F("Message"));
+        LoRa.readBytes((uint8_t*)&rs1, sizeof(rs1));
+      }
+      break;      
+    }     
+  } 
+  LoRa.sleep();
+
+  if (rs1.tag == tag && rs1.resp == (byte)70)
+  {
+    // Serial.print(F("System Initialising"));
+    EEPROM.write(1, true);
+    Serial.println(EEPROM.read(1));
+    Serial.print(F("System Initialising with wipe"));
+     /// Begin GPS and Acquire Lock ////
+    acqGPS();
+    
+    wipe_memory = true;
+
+    px1.request = (byte)106;
+    px1.tag = tag;
+    LoRa.idle();
+    LoRa.beginPacket();
+    LoRa.write((uint8_t*)&px1, sizeof(px1));
+    LoRa.endPacket();
+    LoRa.sleep();
+  }
+
+  if (rs1.tag == tag && rs1.resp == (byte)71)
+  {
+    Serial.print(F("System Initialising without wipe"));
+    EEPROM.write(1, true);
+    Serial.println(EEPROM.read(1));
+     /// Begin GPS and Acquire Lock ////
+    // acqGPS();
+
+    wipe_memory = false;
+
+    px1.request = (byte)105;
+    px1.tag = tag;
+    LoRa.idle();
+    LoRa.beginPacket();
+    LoRa.write((uint8_t*)&px1, sizeof(px1));
+    LoRa.endPacket();
+    LoRa.sleep();
+
+  }
+
+  if (rs1.tag == tag && rs1.resp == (byte)115){
+        Serial.print(F("Indefinite Sleep"));
+        EEPROM.put(1, false);
+        Serial.println(EEPROM.read(1));
+        delay(50);  
+        set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+        sleep_enable();      
+        sleep_cpu();
+  }
+
+  Serial.println(EEPROM.read(1));
+  if (activation_resp_rcvd == false)
+  {
+    if (EEPROM.read(1) == false){
+    Serial.println(F("SLEEP1"));
+    delay(50);
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    sleep_enable();
+    sleep_cpu();
+    }else{
+    Serial.println(F("Reset"));
+    Serial.print(F("System Re - Initialising"));
+    EEPROM.write(1, true);
+    Serial.println(EEPROM.read(1));
+     /// Begin GPS and Acquire Lock ////
+    acqGPS();
+
+    wipe_memory = false;
+
+    px1.request = (byte)105;
+    px1.tag = tag;
+    LoRa.idle();
+    LoRa.beginPacket();
+    LoRa.write((uint8_t*)&px1, sizeof(px1));
+    LoRa.endPacket();
+    LoRa.sleep();
+    }
   }    
 }
 
-void mortalityCheck(bool m){
-  if (m == true)
-  {
-    if (currentTime - (last_act_trigger + 86400) > 86400)
-    {
-      mortality = true; 
-    }    
-  }  
-}
-
-void risr(){
-  rtc_int_triggered = true;
-  detachInterrupt(RINT);
-  detachInterrupt(AINT1);
-}
-
-void aisr(){
-  act_int_triggered = true;
-  mortality = false;
-  detachInterrupt(AINT1);
-  detachInterrupt(RINT);
-}
-
-void validateAlarms(){
-  if (rtc.alarm(0))
-  {
-    Serial.println(F("Resetting Alarm 0 Flag"));
-  }
-  if (rtc.alarm(1))
-  {
-    Serial.println(F("Resetting Alarm 0 Flag"));
-  }
-  time_t x = rtc.get();
-  Serial.println(x);
-  if (x > next_gps_wakeup)
-  {
-    Serial.println(F("GPS Alarm Missed"));
-    next_gps_wakeup = x + 10;
-    rtc.setAlarm(0, next_gps_wakeup);      
-    rtc.enableAlarm(0, ALM_MATCH_DATETIME);
-  }
-  if (x > next_gsm_wakeup)
-  {
-    Serial.println(F("GSM Alarm Missed"));
-    next_gsm_wakeup = x + 120;
-    rtc.setAlarm(1, next_gsm_wakeup);      
-    rtc.enableAlarm(1, ALM_MATCH_DATETIME);
-  }  
-}
 
 void setup() {
   // put your setup code here, to run once:
   Serial.begin(115200);
   Serial1.begin(9600);
-  Serial2.begin(9600);
-  pinMode(GPS_PIN, OUTPUT);
-  pinMode(GSM_PIN, OUTPUT);
-  pinMode(RTC_PIN, OUTPUT);
+  Serial2.begin(19200);
   Wire.swapModule(&TWI1);
   Wire.usePullups();
   Wire.begin();
-  SPI.begin();
   RTC_init();
 
-  Serial.print(F("Tag ID :")); Serial.println(tag);Serial.println();
-  Serial.println(F("Initializing..."));
+  //***********************************************//
+  // if(!acce.begin()){
+  //    Serial.println(F("Communication failed, check the connection and I2C address setting when using I2C communication."));
+  //    delay(1000);
+  // }else{
+  // Serial.print(F("chip id : "));
+  // Serial.println(acce.getID(),HEX);
+  // }
+  // acce.softReset();
+  // acce.setRange(DFRobot_LIS2DW12::e4_g);
+  // acce.setFilterPath(DFRobot_LIS2DW12::eLPF);
+  // acce.setFilterBandwidth(DFRobot_LIS2DW12::eRateDiv_4);
+  // acce.setWakeUpDur(/*dur = */2);
+  // acce.setWakeUpThreshold(/*threshold = */0.3);
+  // acce.setPowerMode(DFRobot_LIS2DW12::eContLowPwrLowNoise1_12bit);
+  // acce.setActMode(DFRobot_LIS2DW12::eDetectAct);
+  // acce.setInt1Event(DFRobot_LIS2DW12::eWakeUp);
+  // acce.setDataRate(DFRobot_LIS2DW12::eRate_100hz);
   
-  //***************************************************//
-  
-
-  //***************************************************//
-
-  if(!acce.begin()){
-  Serial.println(F("Acc Error"));
-  delay(1000);
-  }else{
-  Serial.print(F("chip id : "));
-  Serial.println(acce.getID(),HEX);
+  //***********************************************//
+  LoRa.setPins(LCS, LRST, LDIO0);
+  if(!LoRa.begin(867E6)){
+    Serial.println(F("LoRa Failed Init"));
   }
-  acce.softReset();
-  acce.setRange(DFRobot_LIS2DW12::e4_g);
-  acce.setFilterPath(DFRobot_LIS2DW12::eLPF);
-  acce.setFilterBandwidth(DFRobot_LIS2DW12::eRateDiv_4);
-  acce.setWakeUpDur(/*dur = */2);
-  acce.setWakeUpThreshold(/*threshold = */0.3);
-  acce.setPowerMode(DFRobot_LIS2DW12::eContLowPwrLowNoise1_12bit);
-  acce.setActMode(DFRobot_LIS2DW12::eDetectAct);
-  acce.setInt1Event(DFRobot_LIS2DW12::eWakeUp);
-  acce.setDataRate(DFRobot_LIS2DW12::eRate_100hz);
-  if (activity_enabled == true)
-  {
-    attachInterrupt(digitalPinToInterrupt(AINT1), aisr, CHANGE);
-  }else{
-    detachInterrupt(AINT1);
-  }
-
-//***************************************************//
-
+  LoRa.setTxPower(20, PA_OUTPUT_PA_BOOST_PIN);
+  LoRa.setSpreadingFactor(12);
+  // LoRa.setSignalBandwidth(62.5E3);
+  LoRa.sleep();
+  //***********************************************//
+  // activationPing();
+  //***********************************************//
   if(flash.powerUp()){
     Serial.println(F("Powered Up1"));
   }
   if(!flash.begin()){
-    Serial.println(F("Starting Flash"));
+    Serial.println(F("Flash again"));
     Serial.println(flash.error(VERBOSE));
   } 
   Serial.println(flash.getManID());
@@ -374,7 +580,6 @@ void setup() {
     Serial.println(F("Powered Up"));
   }else{
     Serial.println(F("PWR UP Failed!"));
-    Serial.println(flash.error(VERBOSE));
   }
   if (wipe_memory == true)
   {
@@ -386,8 +591,8 @@ void setup() {
       Serial.println(flash.error(VERBOSE));
     }
   }else{
-    rAdd = flash.getAddress(16);
-    wAdd = flash.getAddress(16);
+    rAdd = flash.getAddress(15); 
+    wAdd = flash.getAddress(15);
   }    
   if(flash.powerDown()){
     Serial.println("Powered Down");
@@ -396,38 +601,43 @@ void setup() {
     Serial.println(flash.error(VERBOSE));
   }
 
-//***************************************************//
-  if (activate == true)
+  //***********************************************//
+  acqGPS();
+  //***************************************************//
+  digitalWrite(GSM_PIN,HIGH);
+  Serial.println("Warming Iridium");
+  delay(15000);
+  Serial.println("Starting Iridium");
+  modem.setPowerProfile(IridiumSBD::DEFAULT_POWER_PROFILE);
+  int err = modem.begin();
+  if (err != ISBD_SUCCESS)
   {
-    acqGPS();
-    // strtTime = 1672052568; 
-    Serial.println(strtTime);
-    next_gps_wakeup = strtTime + (gpsFrequency*60);
-    
-    next_gsm_wakeup = strtTime + (transmissionFrequency*60);
-
-    digitalWrite(RTC_PIN, HIGH);
-    rtc.set(strtTime);
-    Serial.println(rtc.get());
-    delay(100);
-    rtc.alarmPolarity(HIGH);
-    rtc.setAlarm(0, next_gps_wakeup);
-    rtc.setAlarm(1, next_gsm_wakeup);
-    rtc.enableAlarm(0, ALM_MATCH_DATETIME);
-    rtc.enableAlarm(1, ALM_MATCH_DATETIME);
-    digitalWrite(RTC_PIN, LOW);
-
-    attachInterrupt(digitalPinToInterrupt(RINT), risr, CHANGE);
+    Serial.print(F("Begin failed: error "));
+    Serial.println(err);
+    if (err == ISBD_NO_MODEM_DETECTED)
+      Serial.println(F("No modem detected: check wiring."));
+    return;
+  }else{
+    if (err == ISBD_SUCCESS){
+      Serial.println("Iridium Ready");      
+      Serial.println(modem.isAsleep());
+      Serial.println(modem.isConnected());
+      modem.adjustSendReceiveTimeout(120);
+    }
   }
+  digitalWrite(GSM_PIN,LOW);
+  delay(5000);
+  //***********************************************//
 
   gpsCounterTarget = gpsFrequency*60;
   pingCounterTarget = transmissionFrequency*60;  
+  gpsSecondCounter = 0;
+  pingSecondCounter = 0;
 
-//***************************************************//
-  
+  //***********************************************//
   Serial.println("SYSTEM READY");
   Serial.flush();
-//***************************************************//
+  //***********************************************//
   set_sleep_mode(SLEEP_MODE_PWR_DOWN);
   sleep_enable();
   sleep_cpu();
@@ -435,9 +645,8 @@ void setup() {
 
 void loop() {
   // put your main code here, to run repeatedly:
-  switch (mainMode)
-  {
-  case 0: // Normal Mode loop
+  //**************************************************************//
+  
     Serial.println(F("Mode 1"));
     mTime = 0;
     if (gpsSecondCounter >= gpsCounterTarget)
@@ -453,28 +662,22 @@ void loop() {
     }
     if (pingSecondCounter >= pingCounterTarget)
     {
-      Serial.println(F("Ping"));
       digitalWrite(GSM_PIN, HIGH);
-      delay(20000);
-      Btime = 0;
-      int sq;
-      while (Btime < 60000)
-      {
-        modem.getSignalQuality(sq);
-        if (sq >= 2)
+      Serial.print("IRIDIUM STARTING");
+      delay(10000);
+      do
         {
-          break;
-        }        
-      }
-      while (rAdd < wAdd)
-      {
-        if (sq >= 2)
-        {
-          read_send();
-        }
-        rAdd = rAdd + 19;
-      }            
-      digitalWrite(GSM_PIN, LOW);    
+          Serial.println("Init Stream");
+          irdSend();
+          delay(50);
+          rAdd = rAdd + 15;
+          Serial.println(rAdd);
+        
+        } while (rAdd <= wAdd);
+      digitalWrite(GSM_PIN, LOW);
+      delay(5000);
+
+      Serial.println("Competed Ird Transmit");
       
       pingSecondCounter = 0;
       if ((mTime/1000) < (transmissionFrequency*60))
@@ -487,9 +690,9 @@ void loop() {
     Serial.print(gpsSecondCounter); Serial.println(pingSecondCounter);
     Serial.flush();
     sleep_cpu();
-    break;
     
-    default:
-    break;
-  }    
-}
+}  
+
+//********************************************************************//
+//************************* END OF CODE ******************************//
+//********************************************************************//
